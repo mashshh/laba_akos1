@@ -1,123 +1,149 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/log_backup.sh"
+ROOT="$(mktemp -d)"
+LOG="$ROOT/log"
+BK="$ROOT/backup"
+trap 'rm -rf "$ROOT"' EXIT
 
-LOG_DIR="${1:-}"
-PERCENT_LIMIT="${2:-70}"
-BACKUP_DIR="${3:-/backup}"
-THRESHOLD_ARG="${4:-}"
+FILES=10
+FILE_MB=55
+THR="1G"
+THR_BYTES=1073741824
+unset LAB1_MAX_COMPRESSION
 
-parse_size() {
-    local value="$1" num suffix
-    if [[ "$value" =~ ^([0-9]+)([KkMmGg]?)$ ]]; then
-        num="${BASH_REMATCH[1]}"
-        suffix="${BASH_REMATCH[2]}"
-        case "$suffix" in
-            K|k) echo $(( num * 1024 )) ;;
-            M|m) echo $(( num * 1024 * 1024 )) ;;
-            G|g) echo $(( num * 1024 * 1024 * 1024 )) ;;
-            *)   echo "$num" ;;
-        esac
+PASSED=0
+FAILED=0
+OUT=""
+CODE=0
+
+
+FREE_KB=$(df -P -k "$ROOT" | awk 'NR==2 {print $4}')
+if (( FREE_KB < 700 * 1024 )); then
+    echo "Not enough disk space: ~700 MB must be free." >&2
+    exit 2
+fi
+
+
+relpath() {
+    local n; n=$(printf '%02d' "$1")
+    if (( $1 == 4 || $1 == 8 )); then echo "sub/app log_$n.log"; else echo "app log_$n.log"; fi
+}
+
+
+setup() {
+    rm -rf "$LOG" "$BK"
+    mkdir -p "$LOG/sub" "$BK"
+    local i f
+    for (( i = 1; i <= FILES; i++ )); do
+        f="$LOG/$(relpath "$i")"
+        dd if=/dev/zero of="$f" bs=1M count=$FILE_MB status=none
+        touch -d "2020-01-$(printf '%02d' "$i") 00:00:00" "$f"
+    done
+}
+
+
+run() {
+    OUT="$("$SCRIPT" "$@" 2>&1)"
+    CODE=$?
+}
+
+
+report() {
+    if [[ "$2" == "0" ]]; then
+        echo "  [PASS] $1"; PASSED=$(( PASSED + 1 ))
     else
-        return 1
+        echo "  [FAIL] $1"; FAILED=$(( FAILED + 1 ))
+        echo "         exit code: $CODE; script output:"
+        echo "$OUT" | sed 's/^/         | /'
     fi
 }
 
+archive_path() { ls "$BK"/log_backup_*."$1" 2>/dev/null | head -n1; }
 
-if [[ -z "$LOG_DIR" ]]; then
-    echo "Usage: $0 <log_dir> [N_percent=70] [backup_dir=/backup] [threshold=<partition size>]" >&2
-    exit 1
+echo "Testing $SCRIPT"
+echo "(each test: ${FILES} files x ${FILE_MB} MB = $(( FILES * FILE_MB )) MB, threshold $THR)"
+echo
+
+#Test 1
+setup
+run "$LOG" 80 "$BK" "$THR"
+ok=0
+(( CODE == 0 )) || ok=1
+[[ -z "$(ls -A "$BK")" ]] || ok=1
+(( $(find "$LOG" -type f | wc -l) == FILES )) || ok=1
+report "1. Below N% of threshold: no archive created, files untouched" $ok
+
+#Test 2
+setup
+run "$LOG" 30 "$BK" "$THR"
+ok=0
+(( CODE == 0 )) || ok=1
+[[ -n "$(archive_path tar.gz)" ]] || ok=1
+used=$(find "$LOG" -type f -printf '%s\n' | awk '{s+=$1} END {printf "%.0f", s}')
+(( used <= THR_BYTES * 30 / 100 )) || ok=1
+report "2. Above N% of threshold: .tar.gz archive created, usage <= 30% of threshold" $ok
+
+#Test 3
+setup
+run "$LOG" 30 "$BK" "$THR"
+ok=0
+A="$(archive_path tar.gz)"
+expected="$(for i in 1 2 3 4 5; do relpath "$i"; done | sort)"
+actual="$(tar -tzf "$A" 2>/dev/null | sort)"
+[[ "$expected" == "$actual" ]] || ok=1
+for i in 1 2 3 4 5;  do [[ ! -e "$LOG/$(relpath "$i")" ]] || ok=1; done
+for i in 6 7 8 9 10; do [[   -e "$LOG/$(relpath "$i")" ]] || ok=1; done
+report "3. Archive contains exactly the 5 oldest files, newest files remain" $ok
+
+#Test 4
+ok=0
+run "$ROOT/no_such_folder" 50 "$BK" "$THR";  (( CODE != 0 )) || ok=1
+run "$LOG" abc "$BK" "$THR";                 (( CODE != 0 )) || ok=1
+run "$LOG" 150 "$BK" "$THR";                 (( CODE != 0 )) || ok=1
+run "$LOG" 50 "$BK" abc;                     (( CODE != 0 )) || ok=1
+run;                                         (( CODE != 0 )) || ok=1
+report "4. Invalid arguments (no folder, N = abc / 150, threshold abc, no arguments) -> error" $ok
+
+#Test 5
+setup
+run "$LOG" 30 "$BK" "$THR"
+ok=0
+A="$(archive_path tar.gz)"
+gzip -t "$A" 2>/dev/null || ok=1
+mkdir -p "$ROOT/restore"
+tar -xzf "$A" -C "$ROOT/restore" 2>/dev/null || ok=1
+(( $(find "$ROOT/restore" -type f | wc -l) == 5 )) || ok=1
+for i in 1 2 3 4 5; do
+    sz=$(stat -c %s "$ROOT/restore/$(relpath "$i")" 2>/dev/null || echo 0)
+    (( sz == FILE_MB * 1024 * 1024 )) || ok=1
+done
+rm -rf "$ROOT/restore"
+report "5. Archive is readable, files extract intact (names with spaces, subfolders)" $ok
+
+#Test 6
+setup
+LAB1_MAX_COMPRESSION=1 run "$LOG" 30 "$BK" "$THR"
+ok=0
+A="$(archive_path tar.lzma)"
+[[ -n "$A" ]] || ok=1
+if [[ -n "$A" ]]; then
+    tar --lzma -tf "$A" >/dev/null 2>&1 || ok=1
+    file "$A" 2>/dev/null | grep -qi 'lzma' || ok=1
 fi
-if [[ ! -d "$LOG_DIR" ]]; then
-    echo "Error: '$LOG_DIR' is not a directory" >&2
-    exit 1
-fi
-if ! [[ "$PERCENT_LIMIT" =~ ^[0-9]+$ ]] || (( PERCENT_LIMIT < 1 || PERCENT_LIMIT > 100 )); then
-    echo "Error: N must be an integer from 1 to 100" >&2
-    exit 1
-fi
+[[ -z "$(archive_path tar.gz)" ]] || ok=1
+report "6. LAB1_MAX_COMPRESSION=1: .tar.lzma archive created, lzma format" $ok
+
+#Test 7
+setup
+run "$LOG" 30 "$BK" 2G
+ok=0
+(( CODE == 0 )) || ok=1
+[[ -z "$(ls -A "$BK")" ]] || ok=1
+(( $(find "$LOG" -type f | wc -l) == FILES )) || ok=1
+report "7. Same files, threshold 2G: 550 MB is below 30% of it, nothing archived" $ok
 
 
-if [[ -n "$THRESHOLD_ARG" ]]; then
-    if ! THRESHOLD_BYTES=$(parse_size "$THRESHOLD_ARG") || (( THRESHOLD_BYTES == 0 )); then
-        echo "Error: threshold must be a positive size such as 500M, 1G or a number of bytes" >&2
-        exit 1
-    fi
-else
-    read -r BLOCK_SIZE BLOCKS < <(stat -f -c '%S %b' "$LOG_DIR")
-    THRESHOLD_BYTES=$(( BLOCK_SIZE * BLOCKS ))
-fi
-
-
-if [[ "${LAB1_MAX_COMPRESSION:-0}" == "1" ]]; then
-    TAR_FLAG="--lzma"
-    EXT="tar.lzma"
-    ALGO="lzma"
-else
-    TAR_FLAG="-z"
-    EXT="tar.gz"
-    ALGO="gzip"
-fi
-
-
-dir_size() {
-    find "$LOG_DIR" -type f -printf '%s\n' | awk '{s+=$1} END {printf "%.0f", s}'
-}
-percent() {
-    awk -v a="$1" -v t="$THRESHOLD_BYTES" 'BEGIN {printf "%.1f", a * 100 / t}'
-}
-mb() { echo $(( $1 / 1024 / 1024 )); }
-
-SIZE=$(dir_size)
-
-echo "Folder:       $LOG_DIR"
-echo "Threshold:    $(mb "$THRESHOLD_BYTES") MB"
-echo "Folder usage: $(percent "$SIZE")% of threshold ($(mb "$SIZE") MB of $(mb "$THRESHOLD_BYTES") MB), allowed: ${PERCENT_LIMIT}%"
-
-
-TARGET=$(( THRESHOLD_BYTES * PERCENT_LIMIT / 100 ))
-if (( SIZE <= TARGET )); then
-    echo "Usage is within the limit, nothing to archive."
-    exit 0
-fi
-
-TO_FREE=$(( SIZE - TARGET ))
-echo "Need to free: $(mb "$TO_FREE") MB"
-
-
-LIST="$(mktemp)"
-trap 'rm -f "$LIST"' EXIT
-
-FREED=0
-COUNT=0
-
-while IFS=' ' read -r -d '' _mtime FSIZE RELPATH; do
-    printf '%s\0' "$RELPATH" >> "$LIST"
-    FREED=$(( FREED + FSIZE ))
-    COUNT=$(( COUNT + 1 ))
-    (( FREED >= TO_FREE )) && break
-done < <(find "$LOG_DIR" -type f -printf '%T@ %s %P\0' | sort -z -n)
-
-if (( COUNT == 0 )); then
-    echo "No files to archive in the folder." >&2
-    exit 1
-fi
-
-
-mkdir -p "$BACKUP_DIR"
-ARCHIVE="$BACKUP_DIR/log_backup_$(date +%Y%m%d_%H%M%S).$EXT"
-
-echo "Archiving files: $COUNT ($(mb "$FREED") MB), algorithm: $ALGO"
-tar "$TAR_FLAG" -cf "$ARCHIVE" -C "$LOG_DIR" --null -T "$LIST"
-
-
-(cd "$LOG_DIR" && xargs -0 rm -f -- < "$LIST")
-
-
-NEW_SIZE=$(dir_size)
-echo "Archive:      $ARCHIVE"
-echo "Done. Folder usage is now: $(percent "$NEW_SIZE")% of threshold"
-
-if (( NEW_SIZE > TARGET )); then
-    echo "Warning: limit not reached - no more files left to archive." >&2
-fi
+echo
+echo "Summary: passed $PASSED of $(( PASSED + FAILED ))"
+(( FAILED == 0 ))
