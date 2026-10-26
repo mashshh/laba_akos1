@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 
+if [[ -z "${LAB1_IN_NS:-}" ]]; then
+    SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    if ! unshare -rm sh -c 'd="$(mktemp -d)" && mount -t tmpfs tmpfs "$d" && umount "$d" && rmdir "$d"' 2>/dev/null; then
+        echo "Cannot mount tmpfs without root here (unshare -rm is blocked)." >&2
+        echo "Use ./test_log_backup.sh instead (it passes the threshold explicitly)." >&2
+        exit 2
+    fi
+    exec env LAB1_IN_NS=1 unshare -rm bash "$SELF" "$@"
+fi
+
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/log_backup.sh"
 ROOT="$(mktemp -d)"
 LOG="$ROOT/log"
 BK="$ROOT/backup"
-trap 'rm -rf "$ROOT"' EXIT
+trap 'cd /; umount "$LOG" 2>/dev/null; rm -rf "$ROOT"' EXIT
 
 FILES=10
 FILE_MB=55
-THR="1G"
-THR_BYTES=1073741824
 unset LAB1_MAX_COMPRESSION
 
 PASSED=0
@@ -17,6 +25,10 @@ FAILED=0
 OUT=""
 CODE=0
 
+mkdir -p "$LOG"
+mount -t tmpfs -o size=1G tmpfs "$LOG"
+read -r BLOCK_SIZE BLOCKS < <(stat -f -c '%S %b' "$LOG")
+THR_BYTES=$(( BLOCK_SIZE * BLOCKS ))
 
 FREE_KB=$(df -P -k "$ROOT" | awk 'NR==2 {print $4}')
 if (( FREE_KB < 700 * 1024 )); then
@@ -24,15 +36,14 @@ if (( FREE_KB < 700 * 1024 )); then
     exit 2
 fi
 
-
 relpath() {
     local n; n=$(printf '%02d' "$1")
     if (( $1 == 4 || $1 == 8 )); then echo "sub/app log_$n.log"; else echo "app log_$n.log"; fi
 }
 
-
 setup() {
-    rm -rf "$LOG" "$BK"
+    find "$LOG" -mindepth 1 -delete
+    rm -rf "$BK"
     mkdir -p "$LOG/sub" "$BK"
     local i f
     for (( i = 1; i <= FILES; i++ )); do
@@ -42,12 +53,10 @@ setup() {
     done
 }
 
-
 run() {
     OUT="$("$SCRIPT" "$@" 2>&1)"
     CODE=$?
 }
-
 
 report() {
     if [[ "$2" == "0" ]]; then
@@ -62,12 +71,12 @@ report() {
 archive_path() { ls "$BK"/log_backup_*."$1" 2>/dev/null | head -n1; }
 
 echo "Testing $SCRIPT"
-echo "(each test: ${FILES} files x ${FILE_MB} MB = $(( FILES * FILE_MB )) MB, threshold $THR)"
+echo "(each test: ${FILES} files x ${FILE_MB} MB = $(( FILES * FILE_MB )) MB)"
 echo
 
 #Test 1
 setup
-run "$LOG" 80 "$BK" "$THR"
+run "$LOG" 80 "$BK"
 ok=0
 (( CODE == 0 )) || ok=1
 [[ -z "$(ls -A "$BK")" ]] || ok=1
@@ -76,7 +85,7 @@ report "1. Below N% of threshold: no archive created, files untouched" $ok
 
 #Test 2
 setup
-run "$LOG" 30 "$BK" "$THR"
+run "$LOG" 30 "$BK"
 ok=0
 (( CODE == 0 )) || ok=1
 [[ -n "$(archive_path tar.gz)" ]] || ok=1
@@ -86,7 +95,7 @@ report "2. Above N% of threshold: .tar.gz archive created, usage <= 30% of thres
 
 #Test 3
 setup
-run "$LOG" 30 "$BK" "$THR"
+run "$LOG" 30 "$BK"
 ok=0
 A="$(archive_path tar.gz)"
 expected="$(for i in 1 2 3 4 5; do relpath "$i"; done | sort)"
@@ -98,16 +107,16 @@ report "3. Archive contains exactly the 5 oldest files, newest files remain" $ok
 
 #Test 4
 ok=0
-run "$ROOT/no_such_folder" 50 "$BK" "$THR";  (( CODE != 0 )) || ok=1
-run "$LOG" abc "$BK" "$THR";                 (( CODE != 0 )) || ok=1
-run "$LOG" 150 "$BK" "$THR";                 (( CODE != 0 )) || ok=1
+run "$ROOT/no_such_folder" 50 "$BK";  (( CODE != 0 )) || ok=1
+run "$LOG" abc "$BK";                 (( CODE != 0 )) || ok=1
+run "$LOG" 150 "$BK";                 (( CODE != 0 )) || ok=1
 run "$LOG" 50 "$BK" abc;                     (( CODE != 0 )) || ok=1
 run;                                         (( CODE != 0 )) || ok=1
 report "4. Invalid arguments (no folder, N = abc / 150, threshold abc, no arguments) -> error" $ok
 
 #Test 5
 setup
-run "$LOG" 30 "$BK" "$THR"
+run "$LOG" 30 "$BK"
 ok=0
 A="$(archive_path tar.gz)"
 gzip -t "$A" 2>/dev/null || ok=1
@@ -123,7 +132,7 @@ report "5. Archive is readable, files extract intact (names with spaces, subfold
 
 #Test 6
 setup
-LAB1_MAX_COMPRESSION=1 run "$LOG" 30 "$BK" "$THR"
+LAB1_MAX_COMPRESSION=1 run "$LOG" 30 "$BK"
 ok=0
 A="$(archive_path tar.lzma)"
 [[ -n "$A" ]] || ok=1
@@ -142,7 +151,6 @@ ok=0
 [[ -z "$(ls -A "$BK")" ]] || ok=1
 (( $(find "$LOG" -type f | wc -l) == FILES )) || ok=1
 report "7. Same files, threshold 2G: 550 MB is below 30% of it, nothing archived" $ok
-
 
 echo
 echo "Summary: passed $PASSED of $(( PASSED + FAILED ))"
